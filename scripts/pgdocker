@@ -1,0 +1,75 @@
+#!/bin/bash
+#
+# Run a postgres DB in a docker container and wait for it to start. If it is
+# already running, exit success.
+#-----------------------------------------------------------------------------
+
+PGIMAGE=timescale/timescaledb:2.0.0-pg12
+
+main() {
+  local action="${1:-start}"
+  NAME="${2:-tsdb}"
+  PORT="${3:-${PGPORT:-5432}}"
+  case "${action}" in
+  start)
+    pg_start ;;
+  stop)
+    pg_stop ;;
+  cli)
+    pg_cli ;;
+  *)
+    printf 'Unknown command: %s\n' "${action}" >&2
+    exit 1
+    ;;
+  esac
+}
+
+pg_start() {
+  if is_running && is_ready; then
+    return 0
+   fi
+
+  if ! is_running; then
+    printf 'starting database %s' "${NAME}"
+    docker run --rm --detach --name "${NAME}" -p "${PORT}:5432" \
+      -e POSTGRES_HOST_AUTH_METHOD=trust \
+      "${PGIMAGE}" >/dev/null
+  else
+    printf 'waiting for database %s' "${NAME}"
+  fi
+
+  wait_for_ready && sleep 1 && wait_for_ready && echo ' started'
+}
+
+pg_stop() {
+  if ! is_running; then
+    return 0
+  fi
+  docker kill --signal TERM "${NAME}" > /dev/null
+}
+
+pg_cli() {
+  docker exec -it "${NAME}" psql -U postgres
+}
+
+is_running() {
+  running=$(docker inspect -f '{{.State.Running}}' "${NAME}" 2>/dev/null) && \
+    [[ "${running}" == 'true' ]]
+}
+
+is_ready() {
+  docker exec "${NAME}" pg_isready >/dev/null 2>&1
+}
+
+wait_for_ready() {
+  local c=0
+  while ! is_ready; do
+    printf .
+    ((c++ >= 15)) && { echo ' timeout'; return 1; }
+    sleep 2
+  done
+}
+
+
+#-----------------------------------------------------------------------------
+[[ "$(caller)" != 0\ * ]] || main "$@"
