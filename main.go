@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"sort"
@@ -27,6 +28,16 @@ type CLI struct {
 	Port     uint16   `short:"p" help:"Database TCP port" env:"PGPORT" default:"5432"`
 	Username string   `short:"U" help:"Database username" env:"PGUSER" default:"postgres"`
 	Password string   `short:"p" help:"Database user password" env:"PGPASSWORD"`
+	Workers  int      `short:"w" help:"Number of concurrent queries to DB" default:"1"`
+
+	db *sql.DB
+}
+
+func (c *CLI) Validate() error {
+	if c.Workers <= 0 {
+		return fmt.Errorf("invalid number of workers. must be a positive integer: %d", c.Workers)
+	}
+	return nil
 }
 
 // query is a single parsed query from the input CSV file.
@@ -65,8 +76,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	cli.db = db
 
-	summary, err := run(cli, db)
+	start := time.Now()
+	summary, err := run(cli)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -76,6 +89,7 @@ func main() {
 	fmt.Printf("Total processing time: %v\n", summary.sum.Truncate(time.Microsecond))
 	fmt.Printf("Min / max processing time: %v / %v\n", summary.min.Truncate(time.Microsecond), summary.max.Truncate(time.Microsecond))
 	fmt.Printf("Mean / median processing time: %v / %v\n", summary.mean.Truncate(time.Microsecond), summary.median.Truncate(time.Microsecond))
+	fmt.Printf("Run time: %v\n", time.Since(start).Truncate(time.Microsecond))
 
 	os.Exit(0)
 }
@@ -99,14 +113,14 @@ func dbconnect(config *CLI) (*sql.DB, error) {
 // run executes the tsbench data pipeline and returns the result. Currently
 // that result is just a count of input queries. As the program evolves, it
 // will be the result of the benchmark.
-func run(config *CLI, db *sql.DB) (querySummary, error) {
+func run(config *CLI) (querySummary, error) {
 	group, ctx := errgroup.WithContext(context.Background())
 	queries := make(chan query)
 	queryResults := make(chan queryResult)
 
 	var summary querySummary
 	group.Go(func() error { return readQueries(ctx, config.Input, queries) })
-	group.Go(func() error { return executeQueries(ctx, db, queries, queryResults) })
+	group.Go(func() error { return executeQueries(ctx, config, queries, queryResults) })
 	group.Go(func() error {
 		var err error
 		summary, err = summariseResults(ctx, queryResults)
@@ -174,17 +188,42 @@ func newQuery(row []string) (query, error) {
 	return query{hostname: row[0], start: start, end: end}, nil
 }
 
-func executeQueries(ctx context.Context, db *sql.DB, input <-chan query, output chan<- queryResult) error {
+func executeQueries(ctx context.Context, config *CLI, input <-chan query, output chan<- queryResult) error {
 	defer close(output)
 
 	sqlQ := "SELECT min(usage), max(usage) FROM cpu_usage WHERE host = $1 AND ts >= $2 AND ts <= $3"
-	stmt, err := db.PrepareContext(ctx, sqlQ)
+	stmt, err := config.db.PrepareContext(ctx, sqlQ)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	return worker(ctx, stmt, input, output)
+	workerGroup, gctx := errgroup.WithContext(ctx)
+	workers := make([]chan query, config.Workers)
+	for i := 0; i < len(workers); i++ {
+		i := i // capture loop variable
+		workers[i] = make(chan query)
+		workerGroup.Go(func() error {
+			return worker(gctx, stmt, workers[i], output)
+		})
+	}
+
+	go func() {
+		var q query
+		for recvQuery(ctx, &q, input) {
+			// Hash hostname to determine worker to use.
+			h := fnv.New32a()
+			h.Write([]byte(q.hostname)) //nolint:errcheck
+			workerNum := h.Sum32() % uint32(len(workers))
+			sendQuery(ctx, q, workers[workerNum])
+		}
+
+		for _, w := range workers {
+			close(w)
+		}
+	}()
+
+	return workerGroup.Wait()
 }
 
 func worker(ctx context.Context, stmt *sql.Stmt, input <-chan query, output chan<- queryResult) error {

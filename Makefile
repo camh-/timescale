@@ -1,6 +1,6 @@
 # --- Global -------------------------------------------------------------------
 O = out
-COVERAGE = 20
+COVERAGE = 19
 
 all: build test check-coverage lint  ## build, test, check coverage and lint
 	@if [ -e .git/rebase-merge ]; then git --no-pager log -1 --pretty='%h %s'; fi
