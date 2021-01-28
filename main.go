@@ -137,7 +137,6 @@ func readQueries(ctx context.Context, input io.Reader, output chan<- query) erro
 		return fmt.Errorf("Unknown input format: %s", strings.Join(header, ", "))
 	}
 
-loop:
 	for line := 1; ; line++ {
 		row, err := r.Read()
 		if err == io.EOF {
@@ -151,14 +150,10 @@ loop:
 		if err != nil {
 			return fmt.Errorf("line %d: %w", line, err)
 		}
-		select {
-		case output <- q:
-		case <-ctx.Done():
-			break loop
+		if !sendQuery(ctx, q, output) {
+			return nil
 		}
 	}
-
-	return nil
 }
 
 // newQuery returns a query struct from a CSV row. It is expected that the input
@@ -189,25 +184,14 @@ func executeQueries(ctx context.Context, db *sql.DB, input <-chan query, output 
 	}
 	defer stmt.Close()
 
-loop:
-	for {
-		select {
-		case q, ok := <-input:
-			if !ok {
-				// no more input
-				break loop
-			}
-			qr, err := executeQuery(stmt, q)
-			if err != nil {
-				return err
-			}
-			select {
-			case output <- qr:
-			case <-ctx.Done():
-				break loop
-			}
-		case <-ctx.Done():
-			break loop
+	var q query
+	for recvQuery(ctx, &q, input) {
+		qr, err := executeQuery(stmt, q)
+		if err != nil {
+			return err
+		}
+		if !sendQueryResult(ctx, qr, output) {
+			return nil
 		}
 	}
 
@@ -233,27 +217,20 @@ func executeQuery(stmt *sql.Stmt, q query) (queryResult, error) {
 func summariseResults(ctx context.Context, input <-chan queryResult) (querySummary, error) {
 	summary := querySummary{}
 	results := []queryResult{}
-loop:
-	for {
-		select {
-		case qr, ok := <-input:
-			if !ok {
-				break loop
-			}
-			results = append(results, qr)
-			summary.count++
-			if qr.queryDuration < summary.min || summary.min == 0 {
-				summary.min = qr.queryDuration
-			}
-			if qr.queryDuration > summary.max {
-				summary.max = qr.queryDuration
-			}
-			summary.sum += qr.queryDuration
 
-		case <-ctx.Done():
-			break loop
+	var qr queryResult
+	for recvQueryResult(ctx, &qr, input) {
+		results = append(results, qr)
+		summary.count++
+		if qr.queryDuration < summary.min || summary.min == 0 {
+			summary.min = qr.queryDuration
 		}
+		if qr.queryDuration > summary.max {
+			summary.max = qr.queryDuration
+		}
+		summary.sum += qr.queryDuration
 	}
+
 	summary.mean = time.Duration(int64(summary.sum) / int64(summary.count))
 	summary.median = calculateMedian(results)
 
