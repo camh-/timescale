@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +55,7 @@ func collect(input <-chan query) []query {
 func parse(input string) ([]query, error) {
 	queries := make(chan query)
 	var err error
-	go func() { err = readQueries(strings.NewReader(input), queries) }()
+	go func() { err = readQueries(context.Background(), strings.NewReader(input), queries) }()
 	got := collect(queries)
 	return got, err
 }

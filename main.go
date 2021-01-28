@@ -1,22 +1,32 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/csv"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/alecthomas/kong"
+	_ "github.com/jackc/pgx/v4/stdlib"
 	"golang.org/x/sync/errgroup"
 )
 
 // CLI is the program input taken from the command line. It is annotated with
 // struct tags for github.com/alecthomas/kong to parse.
 type CLI struct {
-	Input *os.File `arg:"" help:"Input CSV filename"`
+	Input    *os.File `arg:"" help:"Input CSV filename"`
+	DBUrl    string   `short:"u" help:"Database connect string URL (overrides individual options)"`
+	DBName   string   `short:"d" help:"Database name" env:"PGDATABASE" default:"homework"`
+	Host     string   `short:"h" help:"Database host name" env:"PGHOST" default:"localhost"`
+	Port     uint16   `short:"p" help:"Database TCP port" env:"PGPORT" default:"5432"`
+	Username string   `short:"U" help:"Database username" env:"PGUSER" default:"postgres"`
+	Password string   `short:"p" help:"Database user password" env:"PGPASSWORD"`
 }
 
 // query is a single parsed query from the input CSV file.
@@ -25,37 +35,85 @@ type query struct {
 	start, end time.Time
 }
 
+// queryResult is the result of executing a query against the database.
+type queryResult struct {
+	// minCPU and maxCPU is the minimum and maximum CPU time for a host
+	// within the start and end time of a query.
+	minCPU, maxCPU float64
+
+	// queryDuration is the amount of time it took to execute the query
+	// against the database and retrieve the result.
+	queryDuration time.Duration
+}
+
+type querySummary struct {
+	count  int
+	sum    time.Duration
+	min    time.Duration
+	max    time.Duration
+	mean   time.Duration
+	median time.Duration
+}
+
 func main() {
 	cli := &CLI{}
 	kong.Parse(cli)
 	defer cli.Input.Close()
 
-	count, err := run(cli)
+	db, err := dbconnect(cli)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("%d records read\n", count)
+	summary, err := run(cli, db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Number of queries: %d\n", summary.count)
+	fmt.Printf("Total processing time: %v\n", summary.sum.Truncate(time.Microsecond))
+	fmt.Printf("Min / max processing time: %v / %v\n", summary.min.Truncate(time.Microsecond), summary.max.Truncate(time.Microsecond))
+	fmt.Printf("Mean / median processing time: %v / %v\n", summary.mean.Truncate(time.Microsecond), summary.median.Truncate(time.Microsecond))
+
 	os.Exit(0)
+}
+
+func dbconnect(config *CLI) (*sql.DB, error) {
+	url := config.DBUrl
+	if url == "" {
+		format := "postgres://%s%s@%s:%d/%s"
+		password := ""
+		if config.Password != "" {
+			password = ":" + config.Password
+		}
+		url = fmt.Sprintf(format, config.Username, password, config.Host, config.Port, config.DBName)
+		if config.Host == "localhost" {
+			url += "?sslmode=disable"
+		}
+	}
+	return sql.Open("pgx", url)
 }
 
 // run executes the tsbench data pipeline and returns the result. Currently
 // that result is just a count of input queries. As the program evolves, it
 // will be the result of the benchmark.
-func run(config *CLI) (int, error) {
-	group := &errgroup.Group{}
+func run(config *CLI, db *sql.DB) (querySummary, error) {
+	group, ctx := errgroup.WithContext(context.Background())
 	queries := make(chan query)
+	queryResults := make(chan queryResult)
 
-	count := 0
-	group.Go(func() error { return readQueries(config.Input, queries) })
+	var summary querySummary
+	group.Go(func() error { return readQueries(ctx, config.Input, queries) })
+	group.Go(func() error { return executeQueries(ctx, db, queries, queryResults) })
 	group.Go(func() error {
 		var err error
-		count, err = countQueries(queries)
+		summary, err = summariseResults(ctx, queryResults)
 		return err
 	})
 
-	return count, group.Wait()
+	return summary, group.Wait()
 }
 
 // readQueries reads a CSV file of queries from input and sends each of them in
@@ -67,7 +125,7 @@ func run(config *CLI) (int, error) {
 //   start_time: a time in the form YYYY-MM-DD HH:MM:SS
 //   end_time: a time in the form YYYY-MM-DD HH:MM:SS
 // The start and end time are in UTC.
-func readQueries(input io.Reader, output chan<- query) error {
+func readQueries(ctx context.Context, input io.Reader, output chan<- query) error {
 	defer close(output)
 
 	r := csv.NewReader(input)
@@ -79,6 +137,7 @@ func readQueries(input io.Reader, output chan<- query) error {
 		return fmt.Errorf("Unknown input format: %s", strings.Join(header, ", "))
 	}
 
+loop:
 	for line := 1; ; line++ {
 		row, err := r.Read()
 		if err == io.EOF {
@@ -92,8 +151,14 @@ func readQueries(input io.Reader, output chan<- query) error {
 		if err != nil {
 			return fmt.Errorf("line %d: %w", line, err)
 		}
-		output <- q
+		select {
+		case output <- q:
+		case <-ctx.Done():
+			break loop
+		}
 	}
+
+	return nil
 }
 
 // newQuery returns a query struct from a CSV row. It is expected that the input
@@ -114,12 +179,93 @@ func newQuery(row []string) (query, error) {
 	return query{hostname: row[0], start: start, end: end}, nil
 }
 
-// countQueries is a temporary function to be the final consumer in the data
-// pipeline. It will be replaced as the program evolves.
-func countQueries(input <-chan query) (int, error) {
-	count := 0
-	for range input {
-		count++
+func executeQueries(ctx context.Context, db *sql.DB, input <-chan query, output chan<- queryResult) error {
+	defer close(output)
+
+	sqlQ := "SELECT min(usage), max(usage) FROM cpu_usage WHERE host = $1 AND ts >= $2 AND ts <= $3"
+	stmt, err := db.PrepareContext(ctx, sqlQ)
+	if err != nil {
+		return err
 	}
-	return count, nil
+
+loop:
+	for {
+		select {
+		case q, ok := <-input:
+			if !ok {
+				// no more input
+				break loop
+			}
+			qr, err := executeQuery(stmt, q)
+			if err != nil {
+				return err
+			}
+			select {
+			case output <- qr:
+			case <-ctx.Done():
+				break loop
+			}
+		case <-ctx.Done():
+			break loop
+		}
+	}
+
+	return nil
+}
+
+func executeQuery(stmt *sql.Stmt, q query) (queryResult, error) {
+	var qr queryResult
+	qStart := time.Now()
+
+	row := stmt.QueryRow(q.hostname, q.start, q.end)
+	if err := row.Scan(&qr.minCPU, &qr.maxCPU); err != nil {
+		return queryResult{}, err
+	}
+
+	qr.queryDuration = time.Since(qStart)
+	return qr, nil
+}
+
+// summariseResults tallies all the query results on the input channel and
+// returns out a summary including the number of queries, total processing
+// tme and the min, max, mean and median processing time.
+func summariseResults(ctx context.Context, input <-chan queryResult) (querySummary, error) {
+	summary := querySummary{}
+	results := []queryResult{}
+loop:
+	for {
+		select {
+		case qr, ok := <-input:
+			if !ok {
+				break loop
+			}
+			results = append(results, qr)
+			summary.count++
+			if qr.queryDuration < summary.min || summary.min == 0 {
+				summary.min = qr.queryDuration
+			}
+			if qr.queryDuration > summary.max {
+				summary.max = qr.queryDuration
+			}
+			summary.sum += qr.queryDuration
+
+		case <-ctx.Done():
+			break loop
+		}
+	}
+	summary.mean = time.Duration(int64(summary.sum) / int64(summary.count))
+	summary.median = calculateMedian(results)
+
+	return summary, nil
+}
+
+func calculateMedian(results []queryResult) time.Duration {
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].queryDuration < results[j].queryDuration
+	})
+	count := len(results)
+	if count%2 == 0 {
+		return (results[(count/2)-1].queryDuration + results[count/2].queryDuration) / 2
+	}
+	return results[count/2].queryDuration
 }
