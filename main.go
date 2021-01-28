@@ -184,6 +184,10 @@ func executeQueries(ctx context.Context, db *sql.DB, input <-chan query, output 
 	}
 	defer stmt.Close()
 
+	return worker(ctx, stmt, input, output)
+}
+
+func worker(ctx context.Context, stmt *sql.Stmt, input <-chan query, output chan<- queryResult) error {
 	var q query
 	for recvQuery(ctx, &q, input) {
 		qr, err := executeQuery(stmt, q)
