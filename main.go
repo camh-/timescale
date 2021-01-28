@@ -187,6 +187,7 @@ func executeQueries(ctx context.Context, db *sql.DB, input <-chan query, output 
 	if err != nil {
 		return err
 	}
+	defer stmt.Close()
 
 loop:
 	for {
